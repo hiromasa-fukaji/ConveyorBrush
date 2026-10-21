@@ -2,31 +2,63 @@
 <html lang="ja"><head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>p5.js Base</title>
-  <script src="https://cdn.jsdelivr.net/npm/p5@1.11.2/lib/p5.js"></script>
-  <!-- <script src="easingSelector.js"></script>  -->
-  <script src="svg-import.js"></script>
-  <script src="sketch.js" defer=""></script>
+  <title>CONVEYOR BRUSH</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
   <style>
-    html, body {
-      margin: 0;
-      padding: 0;
-      width: 100%;
-      height: 100%;
-      overflow: hidden;
-      background: black;
+    :root {
+      --gui-bg: #f1f1f1;
+      --gui-input-bg: rgb(255, 255, 255);
+      --gui-input-bg-hover: #f0f0f0;
+      --gui-input-bg-focus: #e0e0e0;
+      --gui-input-bg-active: #d0d0d0;
+      --gui-input-fg: #242424;
+      --gui-title-fg: #242424;
+      --gui-title-bg: rgb(255, 255, 255);
+      --gui-title-bg-hover: #b6b6b6;
+      --gui-title-bg-focus: #b6b6b6;
+      --gui-title-bg-active: #b6b6b6;
+      --gui-label-fg: #242424;
+      --gui-button-fg: #242424;
+      --gui-button-bg: #dbdbdb;
+      --gui-button-bg-hover: #b6b6b6;
+      --gui-button-bg-focus: #b6b6b6;
+      --gui-button-bg-active: #d5d5d5;
     }
-    body {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    canvas {
-      display: black;
-    }
+    html, body { margin: 0; padding: 0; background: #f1f1f1; height: 100%; overflow: hidden; }
+    body { display: grid; grid-template-columns: 280px 1fr 280px; } /* 左右を同じ幅にして、キャンバスをウィンドウ中央に置く */
+    #pane-holder { --tp-base-font-family: 'IBM Plex Mono', monospace; height: 100vh; overflow-y: auto; background: var(--gui-bg); --tp-base-background-color: var(--gui-bg); --tp-input-background-color: var(--gui-input-bg); --tp-input-background-color-hover: var(--gui-input-bg-hover); --tp-input-background-color-focus: var(--gui-input-bg-focus); --tp-input-background-color-active: var(--gui-input-bg-active); --tp-input-foreground-color: var(--gui-input-fg); --tp-container-foreground-color: var(--gui-title-fg); --tp-container-background-color: var(--gui-title-bg); --tp-container-background-color-hover: var(--gui-title-bg-hover); --tp-container-background-color-focus: var(--gui-title-bg-focus); --tp-container-background-color-active: var(--gui-title-bg-active); --tp-label-foreground-color: var(--gui-label-fg); --tp-button-foreground-color: var(--gui-button-fg); --tp-button-background-color: var(--gui-button-bg); --tp-button-background-color-hover: var(--gui-button-bg-hover); --tp-button-background-color-focus: var(--gui-button-bg-focus); --tp-button-background-color-active: var(--gui-button-bg-active); }
+    #pane-holder { --tp-base-border-radius: 0; }
+    #pane-holder *, #pane-holder *::before, #pane-holder *::after { border-radius: 0 !important; }
+    #pane-holder .tp-rotv { box-shadow: none; }
+    #pane-holder .tp-rotv_b { height: 40px; pointer-events: none; }
+    #pane-holder .tp-rotv_m { display: none; }
+    #pane-holder .tp-fldv_b { pointer-events: none; }
+    #pane-holder .tp-fldv_m { display: none; }
+    #pane-holder .tp-rotv_t { font-size: 13px; line-height: 40px; }
+    #pane-holder .tp-btnv_b { height: 28px; }
+    #sketch-holder { min-width: 0; display: flex; align-items: center; justify-content: center; height: 100vh; }
+    #preview-holder { height: 100vh; overflow-y: auto; background: var(--gui-bg); font-family: 'IBM Plex Mono', monospace; color: var(--gui-label-fg); }
+    .tile-slot { padding: 12px 12px 0; }
+    .tile-slot-label { font-size: 11px; margin-bottom: 6px; }
+    .tile-slot-drop { position: relative; height: 200px; box-sizing: border-box; display: flex; align-items: center; justify-content: center; border: 1px dashed #999; cursor: pointer;
+      background: repeating-conic-gradient(#e6e6e6 0% 25%, #fff 0% 50%) 50% / 16px 16px; }
+    .tile-slot-drop.over { border-color: #242424; background-color: #d0d0d0; }
+    .tile-slot-drop img { max-width: 100%; max-height: 100%; object-fit: contain; pointer-events: none; }
+    .tile-slot-drop span { position: absolute; left: 0; right: 0; bottom: 6px; text-align: center; font-size: 10px; color: #666; pointer-events: none; }
+    canvas { display: block; }
   </style>
 </head>
 <body>
-
-
+  <div id="pane-holder"></div>
+  <div id="sketch-holder"></div>
+  <div id="preview-holder"></div>
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.11.2/lib/p5.js"></script>
+  <script type="module">
+    import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4.0.4/dist/tweakpane.min.js';
+    window.Tweakpane = { Pane };
+  </script>
+  <script src="svg-import.js"></script>
+  <script src="sketch.js" defer></script>
 </body></html>

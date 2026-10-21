@@ -24,23 +24,118 @@ const INITIAL_W = 630;
 const INITIAL_H = 891;
 
 // --- 見た目・動きの調整パラメータ ---
-const CIRCLE_DIAMETER = 32;  // 円の直径(px)
-const CIRCLE_GAP      = -30.5;   // 円と円の間隔(px)。0なら隙間なしでぴったり並ぶ
-const BELT_SPEED      = 0.2;   // 1フレームあたりの移動量(px)
-const TRACK_WIDTH     = 43;  // トラック(ストローク)の太さ
-const CURVE_STEPS     = 100;  // SVG読み込み用:曲線1本あたりの分割数(多いほど滑らかで重い)
-const MIN_POINT_DIST  = 4;   // ドラッグ中、前の点からこの距離以上動いたら新しい点を追加する(px)
-const JITTER_AMOUNT   = 7;   // レール(進行方向)に垂直な向きへのずれの最大値(px)。0でずれなし
-const ZONE_SCALE      = 0.3; // 「揺れる区間/揺れない区間」の粗さ。小さいほど長い区間で切り替わる
-const ZONE_THRESHOLD  = 0.5;   // このゾーンノイズ値を境に揺れON/OFFが切り替わる(0〜1)
-const ZONE_SOFTNESS   = 0.01;  // ON/OFFの境界のなめらかさ。0に近いほどくっきりコントラストが出る
+// 値の本体は PARAMS(Tweakpaneのスライダーが書き換える)。
+// 毎フレーム syncParams() で下のグローバル変数へ写して使う。
+const PARAMS = {
+  circleDiameter: 32,    // 円の直径(px)
+  circleGapRatio: -0.9, // 円と円の間隔(円の直径に対する比率)。0なら隙間なしでぴったり並ぶ。-1に近いほど重なる
+  beltSpeed:      0.2,   // 1フレームあたりの移動量(px)
+  trackWidth:     43,    // トラック(ストローク)の太さ
+  minPointDist:   4,     // ドラッグ中、前の点からこの距離以上動いたら新しい点を追加する(px)
+  jitterAmount:   7,     // レール(進行方向)に垂直な向きへのずれの最大値(px)。0でずれなし
+  zoneScale:      0.3,   // 「揺れる区間/揺れない区間」の粗さ。小さいほど長い区間で切り替わる
+  zoneThreshold:  0.5,   // このゾーンノイズ値を境に揺れON/OFFが切り替わる(0〜1)
+  zoneSoftness:   0.01,  // ON/OFFの境界のなめらかさ。0に近いほどくっきりコントラストが出る
+  showTrack:      true,  // トラックの白い縁取りを表示するか
+  bkgdColor:      "#ffffff",
+  trackColor:     "#ffffff",
+  circleColor:    "#ffffff",
+};
 
-let bkgdColor   = "#ffffff"; // USE_TRANSPARENT_BG=trueの場合は使われない
-let trackColor  = "#ffffff";
-let circleColor = "#ffffff";
+const DEFAULT_PARAMS = { ...PARAMS }; // Reset用の初期値(localStorage復元より前に控える)
 
-const SHOW_TRACK         = true;  // トラックの白い縁取りを表示するか
+const CURVE_STEPS = 100; // SVG読み込み用:曲線1本あたりの分割数(多いほど滑らかで重い)
+
+let CIRCLE_DIAMETER, CIRCLE_GAP, BELT_SPEED, TRACK_WIDTH, MIN_POINT_DIST;
+let JITTER_AMOUNT, ZONE_SCALE, ZONE_THRESHOLD, ZONE_SOFTNESS, SHOW_TRACK;
+let bkgdColor, trackColor, circleColor; // bkgdColorはUSE_TRANSPARENT_BG=trueの場合は使われない
+
 const USE_TRANSPARENT_BG = false; // 背景を透明にするか(シール表示用)
+
+const STORAGE_KEY = 'conveyor-brush-params';
+let pane;
+
+function loadParams() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    if (!saved) return;
+    for (const key of Object.keys(PARAMS)) {
+      if (typeof saved[key] === typeof PARAMS[key]) PARAMS[key] = saved[key];
+    }
+  } catch (e) {}
+}
+
+function saveParams() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(PARAMS));
+  } catch (e) {}
+}
+
+// PARAMS -> グローバル変数へ反映。太さ・色が変わったときだけバッファを作り直す
+function syncParams() {
+  const widthChanged = PARAMS.trackWidth !== TRACK_WIDTH;
+  const colorChanged = PARAMS.circleColor !== circleColor;
+
+  CIRCLE_DIAMETER = PARAMS.circleDiameter;
+  CIRCLE_GAP      = PARAMS.circleGapRatio * PARAMS.circleDiameter; // 直径に比例した間隔(px)
+  BELT_SPEED      = PARAMS.beltSpeed;
+  TRACK_WIDTH     = PARAMS.trackWidth;
+  MIN_POINT_DIST  = PARAMS.minPointDist;
+  JITTER_AMOUNT   = PARAMS.jitterAmount;
+  ZONE_SCALE      = PARAMS.zoneScale;
+  ZONE_THRESHOLD  = PARAMS.zoneThreshold;
+  ZONE_SOFTNESS   = PARAMS.zoneSoftness;
+  SHOW_TRACK      = PARAMS.showTrack;
+  bkgdColor       = PARAMS.bkgdColor;
+  trackColor      = PARAMS.trackColor;
+  circleColor     = PARAMS.circleColor;
+
+  if (widthChanged && tracks) {
+    tracks.forEach(t => { if (t !== activeTrack) buildLayers(t); });
+  }
+  if (colorChanged && markImg) buildTintedImages();
+}
+
+// ------------------------------------------------------------
+// 調整パネル(Tweakpane)
+// ------------------------------------------------------------
+function setupPane() {
+  pane = new Tweakpane.Pane({
+    title: 'CONVEYOR BRUSH',
+    container: document.getElementById('pane-holder')
+  });
+
+  const tile = pane.addFolder({ title: 'Piece' });
+  tile.addBinding(PARAMS, 'circleDiameter', { label: 'piece size', min: 1, max: 100, step: 1 });
+  tile.addBinding(PARAMS, 'circleGapRatio', { label: 'piece gap', min: -0.99, max: 0, step: 0.001 });
+  tile.addBinding(PARAMS, 'beltSpeed', { label: 'speed', min: 0, max: 5, step: 0.05 });
+  tile.addBinding(PARAMS, 'trackWidth', { label: 'track w', min: 1, max: 200, step: 1 });
+  tile.addBinding(PARAMS, 'minPointDist', { label: 'point step', min: 1, max: 100, step: 1 });
+
+  const jitter = pane.addFolder({ title: 'Jitter' });
+  jitter.addBinding(PARAMS, 'jitterAmount', { label: 'amount', min: 0, max: 50, step: 0.5 });
+  jitter.addBinding(PARAMS, 'zoneScale', { label: 'zone scale', min: 0.01, max: 2, step: 0.01 });
+  jitter.addBinding(PARAMS, 'zoneThreshold', { label: 'threshold', min: 0, max: 1, step: 0.01 });
+  jitter.addBinding(PARAMS, 'zoneSoftness', { label: 'softness', min: 0.001, max: 0.5, step: 0.001 });
+
+  const palette = pane.addFolder({ title: 'Palette' });
+  palette.addBinding(PARAMS, 'showTrack', { label: 'show track' });
+  palette.addBinding(PARAMS, 'bkgdColor', { label: 'bg' });
+  palette.addBinding(PARAMS, 'trackColor', { label: 'track color' });
+  palette.addBinding(PARAMS, 'circleColor', { label: 'piece color' });
+
+  pane.addButton({ title: 'Reset Params' }).on('click', () => {
+    Object.assign(PARAMS, DEFAULT_PARAMS);
+    pane.refresh();
+    saveParams();
+  });
+  pane.addButton({ title: 'Undo' }).on('click', () => { if (!activeTrack) tracks.pop(); });
+  pane.addButton({ title: 'Clear Canvas' }).on('click', () => { if (!activeTrack) tracks = []; });
+
+  pane.addButton({ title: 'Export PNG' }).on('click', () => saveCanvas('conveyor-brush', 'png'));
+
+  pane.on('change', saveParams);
+}
 
 let beltOffset = 0;
 
@@ -55,7 +150,13 @@ function preload() {
 
 function setup() {
   pixelDensity(displayDensity()); // ★高DPI画面でもマスク/円バッファがジャギらないようにする
-  createCanvas(INITIAL_W, INITIAL_H);
+  const cnv = createCanvas(INITIAL_W, INITIAL_H);
+  cnv.parent('sketch-holder');
+
+  loadParams();
+  syncParams();
+  setupPane();
+  setupTilePreview();
   buildTintedImages(); // circleColorで着色したtile画像を1回だけ生成する
 
   liveMask   = createGraphics(width, height);
@@ -63,6 +164,8 @@ function setup() {
 }
 
 function draw() {
+  syncParams();
+
   if (USE_TRANSPARENT_BG) {
     clear();
   } else {
@@ -81,9 +184,74 @@ function draw() {
 }
 
 // ------------------------------------------------------------
+// タイルのプレビュー(右パネル)
+// 画像をドラッグ&ドロップ(またはクリックで選択)するとタイルが差し代わる。
+// スロット0 = markImg(tile)、スロット1 = markImg2(tile2)
+// ------------------------------------------------------------
+let tilePreviewImgs = [];
+
+function setupTilePreview() {
+  const holder = document.getElementById('preview-holder');
+
+  // ドロップ先以外に落としたとき、ブラウザが画像を開いてしまうのを防ぐ
+  window.addEventListener('dragover', e => e.preventDefault());
+  window.addEventListener('drop', e => e.preventDefault());
+
+  for (let i = 0; i < 2; i++) {
+    const slot = document.createElement('div');
+    slot.className = 'tile-slot';
+    slot.innerHTML =
+      `<div class="tile-slot-label">PIECE ${i + 1}</div>` +
+      `<div class="tile-slot-drop"><img alt=""><span>DROP IMAGE or CLICK</span></div>`;
+    holder.appendChild(slot);
+
+    const drop = slot.querySelector('.tile-slot-drop');
+    tilePreviewImgs.push(slot.querySelector('img'));
+
+    drop.addEventListener('dragenter', e => { e.preventDefault(); drop.classList.add('over'); });
+    drop.addEventListener('dragover',  e => { e.preventDefault(); drop.classList.add('over'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+    drop.addEventListener('drop', e => {
+      e.preventDefault();
+      drop.classList.remove('over');
+      replaceTile(i, e.dataTransfer.files[0]);
+    });
+    drop.addEventListener('click', () => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'image/*';
+      input.onchange = () => replaceTile(i, input.files[0]);
+      input.click();
+    });
+  }
+  updateTilePreview();
+}
+
+function updateTilePreview() {
+  [markImg, markImg2].forEach((img, i) => {
+    tilePreviewImgs[i].src = img.canvas.toDataURL();
+  });
+}
+
+function replaceTile(slotIndex, file) {
+  if (!file || !file.type.startsWith('image/')) return;
+
+  const reader = new FileReader();
+  reader.onload = () => {
+    loadImage(reader.result, img => {
+      if (slotIndex === 0) markImg = img; else markImg2 = img;
+      buildTintedImages();
+      updateTilePreview();
+    }, () => alert('画像を読み込めませんでした'));
+  };
+  reader.readAsDataURL(file);
+}
+
+// ------------------------------------------------------------
 // マウス操作
 // ------------------------------------------------------------
-function mousePressed() {
+function mousePressed(e) {
+  if (e && e.target && e.target.tagName !== 'CANVAS') return;
   if (mouseX < 0 || mouseX > width || mouseY < 0 || mouseY > height) return;
 
   activeTrack = {
