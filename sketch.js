@@ -18,6 +18,7 @@ let pieces = [];       // ピース画像(p5.Image)。null は画像を入れて
 let tintedPieces = []; // circleColorでtint(色付け)済みの生Canvas(piecesと同じ並び。buildTintedImagesで生成)
 let pieceMeta = [];    // piecesと同じ並び。SVGピースなら { svgText, viewBox }、PNGなどのラスター画像・空の箱は null
 let tracks       = []; // 各線のデータ { pts, segLens, total, mask: { g, bx, by, bw, bh }, cLayer }
+let trackGroupId = 0;    // SVGパスをまとめて読み込んだ線に付ける番号(Undoで一度に戻すため)
 let activeTrack  = null; // ドラッグ中の線(なければnull)
 let liveMask, liveCircle; // ドラッグ中の線だけが使う、キャンバス全面サイズの共有バッファ
 
@@ -46,6 +47,7 @@ const PARAMS = {
 
 const DEFAULT_PARAMS = { ...PARAMS }; // Reset用の初期値(localStorage復元より前に控える)
 
+const CURVE_STEPS = 32;   // SVGパス読み込み用:曲線1本あたりの分割数
 const SIMPLIFY_EPSILON = 0.5; // SVG書き出し時、線の点を間引く許容誤差(px)
 const MAX_PIECES = 8;     // ピースの箱の最大数
 const MAX_PIECE_PX = 256; // ピース画像の長辺の上限(px)。これを超える画像は読み込み時に縮小する
@@ -128,12 +130,19 @@ function setupPane() {
   palette.addBinding(PARAMS, 'trackColor', { label: 'track color' });
   palette.addBinding(PARAMS, 'circleColor', { label: 'piece color' });
 
+  pane.addButton({ title: 'Import Path SVG' }).on('click', () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.svg,image/svg+xml';
+    input.onchange = () => importPathSvgFile(input.files[0]);
+    input.click();
+  });
   pane.addButton({ title: 'Reset Params' }).on('click', () => {
     Object.assign(PARAMS, DEFAULT_PARAMS);
     pane.refresh();
     saveParams();
   });
-  pane.addButton({ title: 'Undo' }).on('click', () => { if (!activeTrack) tracks.pop(); });
+  pane.addButton({ title: 'Undo' }).on('click', undoTrack);
   pane.addButton({ title: 'Clear Canvas' }).on('click', () => { if (!activeTrack) tracks = []; });
 
   pane.addButton({ title: 'Export SVG' }).on('click', exportSVG);
@@ -156,6 +165,11 @@ function setup() {
   pixelDensity(displayDensity()); // ★高DPI画面でもマスク/円バッファがジャギらないようにする
   const cnv = createCanvas(INITIAL_W, INITIAL_H);
   cnv.parent('sketch-holder');
+  // SVGファイルをキャンバスにドロップして、ピースを並べるパスとして読み込む
+  cnv.elt.addEventListener('drop', e => {
+    e.preventDefault();
+    importPathSvgFile(e.dataTransfer.files[0]);
+  });
 
   pieces = pieces.map(limitPieceSize);
   pieceMeta = pieces.map(() => null);
@@ -356,6 +370,55 @@ function prepareSvgPiece(text) {
 }
 
 // ------------------------------------------------------------
+// SVGのパスを読み込み、ピースを並べるトラックとして追加する
+// SVGはキャンバスに収まる大きさに拡大縮小して、中央に置く
+// ------------------------------------------------------------
+function importPathSvgFile(file) {
+  if (!file) return;
+  if (!(file.type === 'image/svg+xml' || /\.svg$/i.test(file.name))) return;
+  file.text().then(importPathSvg);
+}
+
+function importPathSvg(text) {
+  const data = parseSvgTracks(text, CURVE_STEPS);
+  if (!data || data.subpaths.length === 0) {
+    alert('SVGからパス(線)を読み込めませんでした');
+    return;
+  }
+
+  const vb = data.viewBox;
+  const sf = Math.min(width / vb.w, height / vb.h);
+  const offsetX = (width  - vb.w * sf) * 0.5;
+  const offsetY = (height - vb.h * sf) * 0.5;
+  const group = ++trackGroupId;
+  let added = 0;
+
+  data.subpaths.forEach(raw => {
+    // 同じ位置が続く点は取り除き、ほぼ直線上の余分な点は間引く
+    let pts = raw.map(p => ({ x: offsetX + (p.x - vb.minX) * sf, y: offsetY + (p.y - vb.minY) * sf }))
+                 .filter((p, i, arr) => i === 0 || Math.hypot(p.x - arr[i - 1].x, p.y - arr[i - 1].y) > 0.01);
+    pts = simplifyPolyline(pts, 0.1);
+    if (pts.length < 2) return;
+
+    const segLens = [];
+    let total = 0;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const d = Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
+      segLens.push(d);
+      total += d;
+    }
+    if (total === 0) return;
+
+    const track = { pts, segLens, total, group };
+    buildLayers(track);
+    tracks.push(track);
+    added++;
+  });
+
+  if (added === 0) alert('SVGからパス(線)を読み込めませんでした');
+}
+
+// ------------------------------------------------------------
 // マウス操作
 // ------------------------------------------------------------
 function mousePressed(e) {
@@ -398,8 +461,16 @@ function mouseReleased() {
   buildLayers(track); // 共有バッファから、この線専用の小さいバッファに切り替える
 }
 
+// 直前の線を1本戻す。SVGパスをまとめて読み込んだ線は、同じ読み込み分を一度に戻す
+function undoTrack() {
+  if (activeTrack || tracks.length === 0) return;
+  const last = tracks.pop();
+  if (!last.group) return;
+  while (tracks.length && tracks[tracks.length - 1].group === last.group) tracks.pop();
+}
+
 function keyPressed() {
-  if (key === 'z' && tracks.length && !activeTrack) tracks.pop();
+  if (key === 'z') undoTrack();
   if (key === 'c' && !activeTrack) tracks = [];
 }
 
