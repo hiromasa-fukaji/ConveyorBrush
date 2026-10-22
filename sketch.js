@@ -753,10 +753,21 @@ function exportSVG() {
   URL.revokeObjectURL(url);
 }
 
-// 太さ w のストロークを、多角形の集まり(1本の path の d)に変換する。
+// 太さ w のストロークの外形を、1本の path の d に変換する。
 // キャンバスの strokeJoin(MITER) / strokeCap(PROJECT) と同じ形になるようにしてある。
-// すべての多角形の巻き方向をそろえて、clipPathの内側で重なっても打ち消し合わないようにする。
+// まず Clipper で外形を作る(重なりの合体も、自己交差でできる穴も、Clipperが処理する)。
+// 失敗したときだけ、線分ごとの多角形をすべて重ねた形で出す(巻き方向はそろえてある)。
 function strokeOutlinePathD(pts, w, f) {
+  if (typeof ClipperLib !== 'undefined') {
+    try {
+      return clipperStrokeOutlineD(pts, w, f);
+    } catch (e) {
+      console.warn('線の外形の合体に失敗したため、合体せずに書き出します', e);
+    }
+  } else {
+    console.warn('Clipperが読み込めないため、線の外形を合体せずに書き出します');
+  }
+
   const h = w / 2;
   const polys = [];
 
@@ -800,19 +811,7 @@ function strokeOutlinePathD(pts, w, f) {
     }
   }
 
-  // 重なった多角形を1つの外形に合体する(穴があれば穴も別のリングとして出る)
-  if (typeof polygonClipping !== 'undefined') {
-    const toPoly = poly => [[...poly, poly[0]].map(p => [p.x, p.y])];
-    const merged = polygonClipping.union(...polys.map(toPoly));
-    return merged.map(polygon =>
-      polygon.map(ring =>
-        'M' + ring.slice(0, -1).map(p => `${f(p[0])} ${f(p[1])}`).join('L') + 'Z'
-      ).join('')
-    ).join('');
-  }
-
-  // ライブラリが読み込めなかった場合は、合体せずに重ねたまま出す
-  console.warn('polygon-clipping が読み込めないため、線の形を合体せずに書き出します');
+  // Clipperが使えない(読み込めない・計算に失敗した)場合は、合体せずに重ねたまま出す
   return polys.map(poly => {
     let area = 0;
     for (let i = 0; i < poly.length; i++) {
@@ -822,6 +821,21 @@ function strokeOutlinePathD(pts, w, f) {
     const ordered = area < 0 ? poly.slice().reverse() : poly;
     return 'M' + ordered.map(p => `${f(p.x)} ${f(p.y)}`).join('L') + 'Z';
   }).join('');
+}
+
+// Clipperは整数で計算するので、座標をCLIPPER_SCALE倍してから渡し、結果を戻す
+const CLIPPER_SCALE = 100;
+
+function clipperStrokeOutlineD(pts, w, f) {
+  const path = pts.map(p => ({ X: Math.round(p.x * CLIPPER_SCALE), Y: Math.round(p.y * CLIPPER_SCALE) }));
+  const co = new ClipperLib.ClipperOffset(10, 0.25 * CLIPPER_SCALE); // 第1引数 = マイター比の上限(キャンバスと同じ10)
+  co.AddPath(path, ClipperLib.JoinType.jtMiter, ClipperLib.EndType.etOpenSquare); // 開いた線・端は四角く延長(PROJECT)
+  const solution = new ClipperLib.Paths();
+  co.Execute(solution, (w / 2) * CLIPPER_SCALE);
+
+  return solution.map(ring =>
+    'M' + ring.map(p => `${f(p.X / CLIPPER_SCALE)} ${f(p.Y / CLIPPER_SCALE)}`).join('L') + 'Z'
+  ).join('');
 }
 
 // Ramer–Douglas–Peucker法で、折れ線を許容誤差 epsilon(px)以内で単純化する。
