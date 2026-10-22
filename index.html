@@ -40,13 +40,22 @@
     #pane-holder .tp-btnv_b { height: 28px; }
     #sketch-holder { min-width: 0; display: flex; align-items: center; justify-content: center; height: 100vh; }
     #preview-holder { height: 100vh; overflow-y: auto; background: var(--gui-bg); font-family: 'IBM Plex Mono', monospace; color: var(--gui-label-fg); }
-    .tile-slot { padding: 12px 12px 0; }
+    .tile-slot { padding: 12px 4px 0 0; }
     .tile-slot-label { font-size: 11px; margin-bottom: 6px; }
-    .tile-slot-drop { position: relative; height: 200px; box-sizing: border-box; display: flex; align-items: center; justify-content: center; border: 1px dashed #999; cursor: pointer;
+    .tile-slot-drop { position: relative; width: calc(100% - 4px); aspect-ratio: 1; box-sizing: border-box; display: flex; align-items: center; justify-content: center; border: 1px dashed #999; cursor: pointer;
       background: repeating-conic-gradient(#e6e6e6 0% 25%, #fff 0% 50%) 50% / 16px 16px; }
     .tile-slot-drop.over { border-color: #242424; background-color: #d0d0d0; }
-    .tile-slot-drop img { max-width: 100%; max-height: 100%; object-fit: contain; pointer-events: none; }
-    .tile-slot-drop span { position: absolute; left: 0; right: 0; bottom: 6px; text-align: center; font-size: 10px; color: #666; pointer-events: none; }
+    .tile-slot-drop img { width: 60%; aspect-ratio: 1; object-fit: contain; pointer-events: none; } /* 箱の90%角に収め、拡大縮小して長辺が箱の90%になる */
+    .tile-slot-drop span { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center; font-size: 10px; color: #666; pointer-events: none; }
+    .tile-slot-drop img { display: none; }
+    .tile-slot-drop.filled img { display: block; }
+    .tile-slot-drop.filled span { display: none; }
+    .tile-slot-close { position: absolute; top: 4px; right: 4px; width: 20px; height: 20px; padding: 0; border: 0; background: var(--gui-button-bg); color: var(--gui-button-fg); font: 12px/20px 'IBM Plex Mono', monospace; text-align: center; cursor: pointer; opacity: 0; pointer-events: none; }
+    .tile-slot-drop.can-remove:hover .tile-slot-close { opacity: 1; pointer-events: auto; }
+    .tile-slot-close:hover { background: var(--gui-button-bg-hover); }
+    .tile-add { display: block; width: calc(100% - 4px); height: 28px; margin: 12px 0 12px; padding: 0; border: 0; background: var(--gui-button-bg); color: var(--gui-button-fg); font: 14px 'IBM Plex Mono', monospace; cursor: pointer; }
+    .tile-add:hover { background: var(--gui-button-bg-hover); }
+    .tile-add:active { background: var(--gui-button-bg-active); }
     canvas { display: block; }
   </style>
 </head>

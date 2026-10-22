@@ -12,9 +12,8 @@
 // 操作: ドラッグで線を描く / z キーで1本戻す / c キーで全消去
 // =============================================================
 
-let markImg;  // トラック上を流すPNG画像(奇数スロット)
-let markImg2; // トラック上を流すPNG画像(偶数スロット・tileと交互に表示)
-let tintedRaw1, tintedRaw2; // circleColorでtint(色付け)済みの生Canvas(buildTintedImagesで1回だけ生成)
+let pieces = [];       // ピース画像(p5.Image)。null は画像を入れていない空の箱
+let tintedPieces = []; // circleColorでtint(色付け)済みの生Canvas(piecesと同じ並び。buildTintedImagesで生成)
 let tracks       = []; // 各線のデータ { pts, segLens, total, mask: { g, bx, by, bw, bh }, cLayer }
 let activeTrack  = null; // ドラッグ中の線(なければnull)
 let liveMask, liveCircle; // ドラッグ中の線だけが使う、キャンバス全面サイズの共有バッファ
@@ -43,6 +42,9 @@ const PARAMS = {
 };
 
 const DEFAULT_PARAMS = { ...PARAMS }; // Reset用の初期値(localStorage復元より前に控える)
+
+const MAX_PIECES = 8;     // ピースの箱の最大数
+const MAX_PIECE_PX = 256; // ピース画像の長辺の上限(px)。これを超える画像は読み込み時に縮小する
 
 const CURVE_STEPS = 100; // SVG読み込み用:曲線1本あたりの分割数(多いほど滑らかで重い)
 
@@ -93,7 +95,7 @@ function syncParams() {
   if (widthChanged && tracks) {
     tracks.forEach(t => { if (t !== activeTrack) buildLayers(t); });
   }
-  if (colorChanged && markImg) buildTintedImages();
+  if (colorChanged && pieces.some(Boolean)) buildTintedImages();
 }
 
 // ------------------------------------------------------------
@@ -144,14 +146,15 @@ let beltOffset = 0;
 // ============================================================
 
 function preload() {
-  markImg  = loadImage("tile.png");
-  markImg2 = loadImage("tile2.png");
+  pieces = [loadImage("tile.png"), loadImage("tile2.png")];
 }
 
 function setup() {
   pixelDensity(displayDensity()); // ★高DPI画面でもマスク/円バッファがジャギらないようにする
   const cnv = createCanvas(INITIAL_W, INITIAL_H);
   cnv.parent('sketch-holder');
+
+  pieces = pieces.map(limitPieceSize);
 
   loadParams();
   syncParams();
@@ -184,29 +187,42 @@ function draw() {
 }
 
 // ------------------------------------------------------------
-// タイルのプレビュー(右パネル)
-// 画像をドラッグ&ドロップ(またはクリックで選択)するとタイルが差し代わる。
-// スロット0 = markImg(tile)、スロット1 = markImg2(tile2)
+// ピースのプレビュー(右パネル)
+// 箱1つ = ピース1個。画像をドラッグ&ドロップ(またはクリックで選択)すると差し代わる。
+// 箱にマウスを乗せると右上に✕が出て、押すと箱ごと削除。下の＋で空の箱を追加する。
+// コンベア上には、画像の入っている箱が上から順に交互に流れる。
 // ------------------------------------------------------------
-let tilePreviewImgs = [];
-
 function setupTilePreview() {
-  const holder = document.getElementById('preview-holder');
-
   // ドロップ先以外に落としたとき、ブラウザが画像を開いてしまうのを防ぐ
   window.addEventListener('dragover', e => e.preventDefault());
   window.addEventListener('drop', e => e.preventDefault());
+  renderTilePreview();
+}
 
-  for (let i = 0; i < 2; i++) {
+// 削除できるのは、箱が2個以上あり、かつ消しても画像入りの箱が1個以上残る場合
+function canRemovePiece(i) {
+  return pieces.length >= 2 && (!pieces[i] || pieces.some((p, j) => j !== i && p));
+}
+
+// piecesの内容から右パネルを作り直す
+function renderTilePreview() {
+  const holder = document.getElementById('preview-holder');
+  holder.innerHTML = '';
+
+  pieces.forEach((img, i) => {
     const slot = document.createElement('div');
     slot.className = 'tile-slot';
     slot.innerHTML =
-      `<div class="tile-slot-label">PIECE ${i + 1}</div>` +
-      `<div class="tile-slot-drop"><img alt=""><span>DROP IMAGE or CLICK</span></div>`;
+      `<div class="tile-slot-label">Piece${i + 1}</div>` +
+      `<div class="tile-slot-drop"><img alt=""><span>DROP IMAGE or CLICK</span><button class="tile-slot-close" type="button">✕</button></div>`;
     holder.appendChild(slot);
 
     const drop = slot.querySelector('.tile-slot-drop');
-    tilePreviewImgs.push(slot.querySelector('img'));
+    if (img) {
+      drop.querySelector('img').src = img.canvas.toDataURL();
+      drop.classList.add('filled');
+    }
+    if (canRemovePiece(i)) drop.classList.add('can-remove');
 
     drop.addEventListener('dragenter', e => { e.preventDefault(); drop.classList.add('over'); });
     drop.addEventListener('dragover',  e => { e.preventDefault(); drop.classList.add('over'); });
@@ -216,6 +232,11 @@ function setupTilePreview() {
       drop.classList.remove('over');
       replaceTile(i, e.dataTransfer.files[0]);
     });
+    // ✕ボタン: クリックでファイル選択が開かないようにして、箱ごと削除する
+    drop.querySelector('.tile-slot-close').addEventListener('click', e => {
+      e.stopPropagation();
+      removePiece(i);
+    });
     drop.addEventListener('click', () => {
       const input = document.createElement('input');
       input.type = 'file';
@@ -223,25 +244,56 @@ function setupTilePreview() {
       input.onchange = () => replaceTile(i, input.files[0]);
       input.click();
     });
-  }
-  updateTilePreview();
-}
-
-function updateTilePreview() {
-  [markImg, markImg2].forEach((img, i) => {
-    tilePreviewImgs[i].src = img.canvas.toDataURL();
   });
+
+  if (pieces.length < MAX_PIECES) {
+    const add = document.createElement('button');
+    add.className = 'tile-add';
+    add.type = 'button';
+    add.textContent = '＋';
+    add.addEventListener('click', addPiece);
+    holder.appendChild(add);
+  }
 }
 
-function replaceTile(slotIndex, file) {
+// 空の箱を1つ追加する(画像を入れるまでは描画に使われない)
+function addPiece() {
+  if (pieces.length >= MAX_PIECES) return;
+  pieces.push(null);
+  renderTilePreview();
+  const holder = document.getElementById('preview-holder');
+  holder.scrollTop = holder.scrollHeight;
+}
+
+// 箱を1つ削除する
+function removePiece(i) {
+  if (!canRemovePiece(i)) return;
+  pieces.splice(i, 1);
+  buildTintedImages();
+  renderTilePreview();
+}
+
+// 長辺が MAX_PIECE_PX を超えるときだけ、縦横比を保ったまま縮小する。
+// 毎フレーム大きな画像を縮小して描くと重いので、読み込み時に1回だけ小さくしておく。
+function limitPieceSize(img) {
+  const longSide = Math.max(img.width, img.height);
+  if (longSide > MAX_PIECE_PX) {
+    const k = MAX_PIECE_PX / longSide;
+    img.resize(Math.max(1, Math.round(img.width * k)), Math.max(1, Math.round(img.height * k)));
+  }
+  return img;
+}
+
+function replaceTile(i, file) {
   if (!file || !file.type.startsWith('image/')) return;
 
   const reader = new FileReader();
   reader.onload = () => {
     loadImage(reader.result, img => {
-      if (slotIndex === 0) markImg = img; else markImg2 = img;
+      if (i >= pieces.length) return; // 読み込み中に箱が削除された場合
+      pieces[i] = limitPieceSize(img);
       buildTintedImages();
-      updateTilePreview();
+      renderTilePreview();
     }, () => alert('画像を読み込めませんでした'));
   };
   reader.readAsDataURL(file);
@@ -615,8 +667,8 @@ function flattenArc(x1, y1, rx, ry, xRotDeg, largeArcFlag, sweepFlag, x2, y2, st
 // 復元することで、p5のtint()と同様に元の柄・濃淡を保ったまま色だけ変える。
 // ------------------------------------------------------------
 function buildTintedImages() {
-  tintedRaw1 = tintImage(markImg, circleColor);
-  tintedRaw2 = tintImage(markImg2, circleColor);
+  // 空の箱(null)は null のまま。描画側では画像の入っている箱だけを使う
+  tintedPieces = pieces.map(img => img ? tintImage(img, circleColor) : null);
 }
 
 function tintImage(img, hexColor) {
@@ -769,6 +821,17 @@ function pointAtExtendedDistance(track, distance) {
 function drawCirclesWithMask() {
   const spacing = CIRCLE_DIAMETER + CIRCLE_GAP;
 
+  // ★画像の縦横比を保ったまま、高さをCIRCLE_DIAMETERに合わせる(ループ外で1回だけ計算)
+  // ピースごとにアスペクト比が異なる場合があるので、描画幅は個別に用意する。
+  // 画像の入っている箱だけを順に使い、スロット番号で巡回して交互に流す
+  const drawH = CIRCLE_DIAMETER;
+  const halfH = drawH / 2;
+  const items = [];
+  pieces.forEach((img, k) => {
+    if (img && tintedPieces[k]) items.push({ raw: tintedPieces[k], w: drawH * (img.width / img.height) });
+  });
+  if (items.length === 0) return;
+
   tracks.forEach((track, idx) => {
     const total = track.total;
     if (total === 0) return;
@@ -789,19 +852,10 @@ function drawCirclesWithMask() {
     //   巡回による付け替わりを打ち消すために使う
     const beltStep = Math.floor(beltOffset / spacing);
 
-    // ★画像の縦横比を保ったまま、高さをCIRCLE_DIAMETERに合わせる(ループ外で1回だけ計算)
-    // tile/tile2はアスペクト比が異なる場合があるので、それぞれの描画サイズを個別に用意する
-    const drawH = CIRCLE_DIAMETER;
-    const drawW1 = drawH * (markImg.width / markImg.height);
-    const drawW2 = drawH * (markImg2.width / markImg2.height);
-    const halfH = drawH / 2;
-
     // ★p5のpush/translate/rotate/image(状態管理のオーバーヘッドが大きい)を使わず、
     //   生のCanvas2D APIを直接呼ぶことで、画像枚数が多いときの描画コストを下げる
-    // ★元画像ではなく、circleColorでtint済みの版(tintedRaw1/2)を描画に使う
+    // ★元画像ではなく、circleColorでtint済みの版(tintedPieces)を描画に使う
     const ctx = cLayer.drawingContext;
-    const rawImg1 = tintedRaw1;
-    const rawImg2 = tintedRaw2;
 
     for (let i = iMin; i <= iMax; i++) {
       const distAlong = i * spacing + phase;
@@ -828,10 +882,10 @@ function drawCirclesWithMask() {
       const jx = p.x + Math.cos(normalAngle) * jitter;
       const jy = p.y + Math.sin(normalAngle) * jitter;
 
-      // ★スロット番号の偶奇でtile/tile2を交互に描画する
-      const isEven = ((slotId % 2) + 2) % 2 === 0;
-      const rawImg = isEven ? rawImg1 : rawImg2;
-      const drawW  = isEven ? drawW1  : drawW2;
+      // ★スロット番号でピースを巡回して交互に描画する(2個なら従来のtile/tile2の交互配置)
+      const item = items[((slotId % items.length) + items.length) % items.length];
+      const rawImg = item.raw;
+      const drawW  = item.w;
 
       ctx.save();
       ctx.translate(jx - mask.bx, jy - mask.by);
