@@ -143,7 +143,7 @@ function setupPane() {
     saveParams();
   });
   pane.addButton({ title: 'Undo' }).on('click', undoTrack);
-  pane.addButton({ title: 'Clear Canvas' }).on('click', () => { if (!activeTrack) tracks = []; });
+  pane.addButton({ title: 'Clear Canvas' }).on('click', () => { if (!activeTrack) removeAllTracks(); });
 
   pane.addButton({ title: 'Export SVG' }).on('click', exportSVG);
   pane.addButton({ title: 'Export PNG' }).on('click', () => saveCanvas('conveyor-brush', 'png'));
@@ -456,6 +456,7 @@ function mouseReleased() {
   if (track.pts.length < 2) {
     // クリックだけで線にならなかった場合は捨てる
     tracks.splice(tracks.indexOf(track), 1);
+    disposeTrackLayers(track);
     return;
   }
   buildLayers(track); // 共有バッファから、この線専用の小さいバッファに切り替える
@@ -465,13 +466,16 @@ function mouseReleased() {
 function undoTrack() {
   if (activeTrack || tracks.length === 0) return;
   const last = tracks.pop();
+  disposeTrackLayers(last);
   if (!last.group) return;
-  while (tracks.length && tracks[tracks.length - 1].group === last.group) tracks.pop();
+  while (tracks.length && tracks[tracks.length - 1].group === last.group) {
+    disposeTrackLayers(tracks.pop());
+  }
 }
 
 function keyPressed() {
   if (key === 'z') undoTrack();
-  if (key === 'c' && !activeTrack) tracks = [];
+  if (key === 'c' && !activeTrack) removeAllTracks();
 }
 
 // ------------------------------------------------------------
@@ -499,7 +503,9 @@ function tintImage(img, hexColor) {
   ctx.drawImage(raw, 0, 0, img.width, img.height);
 
   ctx.globalCompositeOperation = "source-over";
-  return g.canvas || g.elt;
+  const canvas = g.canvas || g.elt;
+  g.remove(); // 着色用の一時バッファを解放する(canvas自体は、そのまま描画に使える)
+  return canvas;
 }
 
 // ------------------------------------------------------------
@@ -507,6 +513,8 @@ function tintImage(img, hexColor) {
 // 円バッファを1回だけ生成する(毎フレーム createGraphics しない)
 // ------------------------------------------------------------
 function buildLayers(track) {
+  disposeTrackLayers(track); // 作り直すときは、古いバッファを先に解放する
+
   const margin = TRACK_WIDTH / 2 + 4;
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   track.pts.forEach(p => {
@@ -514,16 +522,35 @@ function buildLayers(track) {
     minY = min(minY, p.y); maxY = max(maxY, p.y);
   });
 
-  const bx = floor(minX - margin);
-  const by = floor(minY - margin);
-  const bw = ceil((maxX - minX) + margin * 2);
-  const bh = ceil((maxY - minY) + margin * 2);
+  // 画面の外は見えないので、バッファの範囲はキャンバスの内側に切り詰める
+  // (アートボードの外へ大きくはみ出した図形で、巨大なバッファを作らないため)
+  const x0 = max(0, floor(minX - margin));
+  const y0 = max(0, floor(minY - margin));
+  const x1 = min(width,  ceil(maxX + margin));
+  const y1 = min(height, ceil(maxY + margin));
+  if (x1 <= x0 || y1 <= y0) return; // 完全に画面の外にある線は描かない
+
+  const bx = x0, by = y0, bw = x1 - x0, bh = y1 - y0;
 
   const g = createGraphics(bw, bh);
   strokePolyline(g, track.pts, bx, by);
 
   track.mask   = { g, bx, by, bw, bh };
   track.cLayer = createGraphics(bw, bh);
+}
+
+// 線専用のバッファを解放する(createGraphics は隠しキャンバスをページに残すため、
+// 使い終わったら remove() が必要)。描画中の線が使う共有バッファは解放しない
+function disposeTrackLayers(track) {
+  if (track.mask && track.mask.g !== liveMask) track.mask.g.remove();
+  if (track.cLayer && track.cLayer !== liveCircle) track.cLayer.remove();
+  track.mask = null;
+  track.cLayer = null;
+}
+
+function removeAllTracks() {
+  tracks.forEach(disposeTrackLayers);
+  tracks = [];
 }
 
 // ドラッグ中の線のマスクを、共有バッファに毎フレーム描き直す
