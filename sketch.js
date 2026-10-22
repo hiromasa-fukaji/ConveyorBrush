@@ -8,12 +8,15 @@
 //      - 描き終わった線: バウンディングボックス分だけの小さいバッファを1回だけ作る
 //   3. 円の間隔は CIRCLE_DIAMETER + CIRCLE_GAP の固定値。
 //      開いたパスなので無限に続くコンベアとして扱う
+//   4. ピース(流すタイル)は右パネルの箱に画像またはSVGをドロップして登録する。
+//      SVGピースは、画面用にラスター化しつつ元のSVGも保持し、Export SVGで使う
 //
 // 操作: ドラッグで線を描く / z キーで1本戻す / c キーで全消去
 // =============================================================
 
 let pieces = [];       // ピース画像(p5.Image)。null は画像を入れていない空の箱
 let tintedPieces = []; // circleColorでtint(色付け)済みの生Canvas(piecesと同じ並び。buildTintedImagesで生成)
+let pieceMeta = [];    // piecesと同じ並び。SVGピースなら { svgText, viewBox }、PNGなどのラスター画像・空の箱は null
 let tracks       = []; // 各線のデータ { pts, segLens, total, mask: { g, bx, by, bw, bh }, cLayer }
 let activeTrack  = null; // ドラッグ中の線(なければnull)
 let liveMask, liveCircle; // ドラッグ中の線だけが使う、キャンバス全面サイズの共有バッファ
@@ -43,10 +46,9 @@ const PARAMS = {
 
 const DEFAULT_PARAMS = { ...PARAMS }; // Reset用の初期値(localStorage復元より前に控える)
 
+const SIMPLIFY_EPSILON = 0.5; // SVG書き出し時、線の点を間引く許容誤差(px)
 const MAX_PIECES = 8;     // ピースの箱の最大数
 const MAX_PIECE_PX = 256; // ピース画像の長辺の上限(px)。これを超える画像は読み込み時に縮小する
-
-const CURVE_STEPS = 100; // SVG読み込み用:曲線1本あたりの分割数(多いほど滑らかで重い)
 
 let CIRCLE_DIAMETER, CIRCLE_GAP, BELT_SPEED, TRACK_WIDTH, MIN_POINT_DIST;
 let JITTER_AMOUNT, ZONE_SCALE, ZONE_THRESHOLD, ZONE_SOFTNESS, SHOW_TRACK;
@@ -134,6 +136,7 @@ function setupPane() {
   pane.addButton({ title: 'Undo' }).on('click', () => { if (!activeTrack) tracks.pop(); });
   pane.addButton({ title: 'Clear Canvas' }).on('click', () => { if (!activeTrack) tracks = []; });
 
+  pane.addButton({ title: 'Export SVG' }).on('click', exportSVG);
   pane.addButton({ title: 'Export PNG' }).on('click', () => saveCanvas('conveyor-brush', 'png'));
 
   pane.on('change', saveParams);
@@ -155,6 +158,7 @@ function setup() {
   cnv.parent('sketch-holder');
 
   pieces = pieces.map(limitPieceSize);
+  pieceMeta = pieces.map(() => null);
 
   loadParams();
   syncParams();
@@ -260,6 +264,7 @@ function renderTilePreview() {
 function addPiece() {
   if (pieces.length >= MAX_PIECES) return;
   pieces.push(null);
+  pieceMeta.push(null);
   renderTilePreview();
   const holder = document.getElementById('preview-holder');
   holder.scrollTop = holder.scrollHeight;
@@ -269,6 +274,7 @@ function addPiece() {
 function removePiece(i) {
   if (!canRemovePiece(i)) return;
   pieces.splice(i, 1);
+  pieceMeta.splice(i, 1);
   buildTintedImages();
   renderTilePreview();
 }
@@ -285,18 +291,68 @@ function limitPieceSize(img) {
 }
 
 function replaceTile(i, file) {
-  if (!file || !file.type.startsWith('image/')) return;
+  if (!file) return;
+  const isSvg = file.type === 'image/svg+xml' || /\.svg$/i.test(file.name);
+  if (!isSvg && !file.type.startsWith('image/')) return;
+
+  if (isSvg) {
+    // SVGは、画面用にラスター化した画像と、書き出し用の元のSVGの両方を持つ
+    file.text().then(text => {
+      const info = prepareSvgPiece(text);
+      if (!info) { alert('SVGを読み込めませんでした'); return; }
+      loadImage(info.rasterURL,
+        img => setPiece(i, limitPieceSize(img), { svgText: text, viewBox: info.viewBox }),
+        () => alert('SVGを読み込めませんでした'));
+    });
+    return;
+  }
 
   const reader = new FileReader();
   reader.onload = () => {
-    loadImage(reader.result, img => {
-      if (i >= pieces.length) return; // 読み込み中に箱が削除された場合
-      pieces[i] = limitPieceSize(img);
-      buildTintedImages();
-      renderTilePreview();
-    }, () => alert('画像を読み込めませんでした'));
+    loadImage(reader.result,
+      img => setPiece(i, limitPieceSize(img), null),
+      () => alert('画像を読み込めませんでした'));
   };
   reader.readAsDataURL(file);
+}
+
+function setPiece(i, img, meta) {
+  if (i >= pieces.length) return; // 読み込み中に箱が削除された場合
+  pieces[i] = img;
+  pieceMeta[i] = meta;
+  buildTintedImages();
+  renderTilePreview();
+}
+
+// SVGのviewBox(なければwidth/height)を {minX, minY, w, h} で返す
+function readSvgViewBox(root) {
+  const nums = (root.getAttribute('viewBox') || '').trim().split(/[\s,]+/).map(parseFloat);
+  if (nums.length === 4 && nums.every(Number.isFinite) && nums[2] > 0 && nums[3] > 0) {
+    return { minX: nums[0], minY: nums[1], w: nums[2], h: nums[3] };
+  }
+  const w = parseFloat(root.getAttribute('width'))  || 100;
+  const h = parseFloat(root.getAttribute('height')) || 100;
+  return { minX: 0, minY: 0, w, h };
+}
+
+// SVGの文字列を解析し、画面用にラスター化するためのデータURLと viewBox を返す(失敗したら null)。
+// ブラウザ標準の画像読み込みに任せるので、transform・グラデーション・class なども正しく描かれる。
+function prepareSvgPiece(text) {
+  const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
+  const root = doc.documentElement;
+  if (!root || root.nodeName.toLowerCase() !== 'svg' || doc.querySelector('parsererror')) return null;
+
+  const viewBox = readSvgViewBox(root);
+  const k = MAX_PIECE_PX / Math.max(viewBox.w, viewBox.h); // 長辺が MAX_PIECE_PX になる倍率
+
+  const clone = root.cloneNode(true);
+  clone.setAttribute('viewBox', `${viewBox.minX} ${viewBox.minY} ${viewBox.w} ${viewBox.h}`);
+  clone.setAttribute('width',  Math.max(1, Math.round(viewBox.w * k)));
+  clone.setAttribute('height', Math.max(1, Math.round(viewBox.h * k)));
+
+  const rasterURL = 'data:image/svg+xml;charset=utf-8,' +
+    encodeURIComponent(new XMLSerializer().serializeToString(clone));
+  return { rasterURL, viewBox };
 }
 
 // ------------------------------------------------------------
@@ -345,320 +401,6 @@ function mouseReleased() {
 function keyPressed() {
   if (key === 'z' && tracks.length && !activeTrack) tracks.pop();
   if (key === 'c' && !activeTrack) tracks = [];
-}
-
-// ============================================================
-// SVG読み込み機能(現在は無効。後で復活させる予定のため仕様を残している)
-//
-// 復活手順:
-//   1. index.html の svg-import.js の読み込みはそのまま残してある
-//   2. setup() で  mySvg = new SvgImport("text_4_round.svg");  を呼ぶ
-//   3. draw() で  mySvg.isReady になったら1回だけ  prepareTracks();  を呼ぶ
-//      (tracks に各パスが追加され、ドラッグで描いた線と同じ仕組みで描画される)
-// ============================================================
-let mySvg;
-
-// ------------------------------------------------------------
-// 各パーツ(path / polyline / line)のd属性をSVGパスパーサーで解釈し、
-// 曲線(C/S/Q/T/A)も分割して点列化した上で、キャンバス座標に変換し、
-// 区間長も事前計算しておく
-// ------------------------------------------------------------
-function prepareTracks() {
-  const vb = mySvg.svgViewBox;
-  const sf = min(width / vb.width, height / vb.height);
-  const offsetX = (width  - vb.width  * sf) * 0.5;
-  const offsetY = (height - vb.height * sf) * 0.5;
-
-  const toCanvas = (px, py) => ({
-    x: offsetX + (px - vb.minX) * sf,
-    y: offsetY + (py - vb.minY) * sf
-  });
-
-  tracks = [];
-
-  mySvg.parts.forEach(part => {
-    part.style.hasFill   = false;
-    part.style.hasStroke = false;
-
-    // 1つの<path>にMで区切られた複数の独立したサブパスが
-    // 含まれる場合があるので、それぞれ別トラックとして扱う
-    // (曲線コマンドも正しく分割される)
-    const subpaths = svgPathToSubpaths(part.d, CURVE_STEPS);
-
-    subpaths.forEach(rawPts => {
-      if (rawPts.length < 2) return;
-
-      const pts = rawPts.map(p => toCanvas(p.x, p.y));
-
-      const segLens = [];
-      let total = 0;
-      for (let i = 0; i < pts.length - 1; i++) {
-        const d = dist(pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y);
-        segLens.push(d);
-        total += d;
-      }
-
-      const track = { pts, segLens, total };
-      buildLayers(track); // 描画用のマスク・円バッファを作る
-      tracks.push(track);
-    });
-  });
-}
-
-// ------------------------------------------------------------
-// SVGパスの d 属性をパースし、曲線を線分に分割(フラット化)した
-// 座標点列の配列(サブパスごと)を返す。
-// 対応コマンド: M/m L/l H/h V/v C/c S/s Q/q T/t A/a Z/z
-// ------------------------------------------------------------
-function svgPathToSubpaths(d, curveSteps) {
-  const subpaths = [];
-  let current = [];
-  let cx = 0, cy = 0, sx = 0, sy = 0;
-  let prevCmd = null;   // 直前のコマンド(大文字)
-  let prevCtrl = null;  // S/T の反射制御点用
-  let pos = 0;
-  const len = d.length;
-
-  function skipSep() {
-    while (pos < len && /[\s,]/.test(d[pos])) pos++;
-  }
-  function readNumber() {
-    skipSep();
-    const m = /^[+-]?(\d+\.\d+|\.\d+|\d+)(?:[eE][+-]?\d+)?/.exec(d.slice(pos));
-    if (!m) return 0;
-    pos += m[0].length;
-    return parseFloat(m[0]);
-  }
-  function readFlag() {
-    skipSep();
-    const c = d[pos];
-    if (c === '0' || c === '1') { pos++; return c === '1' ? 1 : 0; }
-    return readNumber() ? 1 : 0;
-  }
-  function pushPt(x, y) { current.push({ x, y }); }
-  function endSubpath() {
-    if (current.length >= 2) subpaths.push(current);
-    current = [];
-  }
-
-  while (pos < len) {
-    skipSep();
-    if (pos >= len) break;
-
-    const ch = d[pos];
-    let cmd;
-    if (/[a-zA-Z]/.test(ch)) {
-      cmd = ch;
-      pos++;
-    } else if (prevCmd) {
-      // 数値が続く場合は直前コマンドの暗黙の繰り返し(MはLとして扱う)
-      cmd = prevCmd === 'M' ? 'L' : prevCmd === 'm' ? 'l' : prevCmd;
-    } else {
-      break;
-    }
-
-    const rel = cmd === cmd.toLowerCase();
-    const C = cmd.toUpperCase();
-
-    switch (C) {
-      case 'M': {
-        const x = readNumber(), y = readNumber();
-        if (current.length) endSubpath();
-        cx = rel ? cx + x : x;
-        cy = rel ? cy + y : y;
-        sx = cx; sy = cy;
-        pushPt(cx, cy);
-        prevCtrl = null;
-        break;
-      }
-      case 'L': {
-        const x = readNumber(), y = readNumber();
-        cx = rel ? cx + x : x;
-        cy = rel ? cy + y : y;
-        pushPt(cx, cy);
-        prevCtrl = null;
-        break;
-      }
-      case 'H': {
-        const x = readNumber();
-        cx = rel ? cx + x : x;
-        pushPt(cx, cy);
-        prevCtrl = null;
-        break;
-      }
-      case 'V': {
-        const y = readNumber();
-        cy = rel ? cy + y : y;
-        pushPt(cx, cy);
-        prevCtrl = null;
-        break;
-      }
-      case 'C': {
-        const x1 = readNumber(), y1 = readNumber();
-        const x2 = readNumber(), y2 = readNumber();
-        const x  = readNumber(), y  = readNumber();
-        const p0 = { x: cx, y: cy };
-        const p1 = { x: rel ? cx + x1 : x1, y: rel ? cy + y1 : y1 };
-        const p2 = { x: rel ? cx + x2 : x2, y: rel ? cy + y2 : y2 };
-        const p3 = { x: rel ? cx + x  : x,  y: rel ? cy + y  : y  };
-        flattenCubicBezier(p0, p1, p2, p3, curveSteps, pushPt);
-        cx = p3.x; cy = p3.y;
-        prevCtrl = p2;
-        break;
-      }
-      case 'S': {
-        const x2 = readNumber(), y2 = readNumber();
-        const x  = readNumber(), y  = readNumber();
-        const p0 = { x: cx, y: cy };
-        const p1 = (prevCtrl && (prevCmd === 'C' || prevCmd === 'c' || prevCmd === 'S' || prevCmd === 's'))
-          ? { x: 2 * cx - prevCtrl.x, y: 2 * cy - prevCtrl.y }
-          : p0;
-        const p2 = { x: rel ? cx + x2 : x2, y: rel ? cy + y2 : y2 };
-        const p3 = { x: rel ? cx + x  : x,  y: rel ? cy + y  : y  };
-        flattenCubicBezier(p0, p1, p2, p3, curveSteps, pushPt);
-        cx = p3.x; cy = p3.y;
-        prevCtrl = p2;
-        break;
-      }
-      case 'Q': {
-        const x1 = readNumber(), y1 = readNumber();
-        const x  = readNumber(), y  = readNumber();
-        const p0 = { x: cx, y: cy };
-        const p1 = { x: rel ? cx + x1 : x1, y: rel ? cy + y1 : y1 };
-        const p2 = { x: rel ? cx + x  : x,  y: rel ? cy + y  : y  };
-        flattenQuadBezier(p0, p1, p2, curveSteps, pushPt);
-        cx = p2.x; cy = p2.y;
-        prevCtrl = p1;
-        break;
-      }
-      case 'T': {
-        const x = readNumber(), y = readNumber();
-        const p0 = { x: cx, y: cy };
-        const p1 = (prevCtrl && (prevCmd === 'Q' || prevCmd === 'q' || prevCmd === 'T' || prevCmd === 't'))
-          ? { x: 2 * cx - prevCtrl.x, y: 2 * cy - prevCtrl.y }
-          : p0;
-        const p2 = { x: rel ? cx + x : x, y: rel ? cy + y : y };
-        flattenQuadBezier(p0, p1, p2, curveSteps, pushPt);
-        cx = p2.x; cy = p2.y;
-        prevCtrl = p1;
-        break;
-      }
-      case 'A': {
-        const rx = readNumber(), ry = readNumber();
-        const xRot = readNumber();
-        const largeArc = readFlag();
-        const sweep = readFlag();
-        const x = readNumber(), y = readNumber();
-        const endX = rel ? cx + x : x;
-        const endY = rel ? cy + y : y;
-        flattenArc(cx, cy, rx, ry, xRot, largeArc, sweep, endX, endY, curveSteps, pushPt);
-        cx = endX; cy = endY;
-        prevCtrl = null;
-        break;
-      }
-      case 'Z': {
-        cx = sx; cy = sy;
-        pushPt(cx, cy);
-        endSubpath();
-        prevCtrl = null;
-        break;
-      }
-      default: {
-        // 未対応コマンドは無視(パース位置がずれるのを防ぐため中断)
-        pos = len;
-        break;
-      }
-    }
-
-    prevCmd = cmd;
-  }
-
-  endSubpath();
-  return subpaths;
-}
-
-function flattenCubicBezier(p0, p1, p2, p3, steps, pushPt) {
-  for (let s = 1; s <= steps; s++) {
-    const t = s / steps;
-    const mt = 1 - t;
-    const a = mt * mt * mt, b = 3 * mt * mt * t, c = 3 * mt * t * t, e = t * t * t;
-    pushPt(
-      a * p0.x + b * p1.x + c * p2.x + e * p3.x,
-      a * p0.y + b * p1.y + c * p2.y + e * p3.y
-    );
-  }
-}
-
-function flattenQuadBezier(p0, p1, p2, steps, pushPt) {
-  for (let s = 1; s <= steps; s++) {
-    const t = s / steps;
-    const mt = 1 - t;
-    const a = mt * mt, b = 2 * mt * t, c = t * t;
-    pushPt(a * p0.x + b * p1.x + c * p2.x, a * p0.y + b * p1.y + c * p2.y);
-  }
-}
-
-// SVG楕円弧(A)を中心パラメータ形式に変換し、角度を等分割して点列化する
-// (SVG仕様の endpoint-to-center parameterization に準拠)
-function flattenArc(x1, y1, rx, ry, xRotDeg, largeArcFlag, sweepFlag, x2, y2, steps, pushPt) {
-  if (rx === 0 || ry === 0 || (x1 === x2 && y1 === y2)) {
-    pushPt(x2, y2);
-    return;
-  }
-  rx = Math.abs(rx);
-  ry = Math.abs(ry);
-  const phi = (xRotDeg * Math.PI) / 180;
-  const cosPhi = Math.cos(phi), sinPhi = Math.sin(phi);
-
-  const dx2 = (x1 - x2) / 2, dy2 = (y1 - y2) / 2;
-  const x1p = cosPhi * dx2 + sinPhi * dy2;
-  const y1p = -sinPhi * dx2 + cosPhi * dy2;
-
-  let rxSq = rx * rx, rySq = ry * ry;
-  const x1pSq = x1p * x1p, y1pSq = y1p * y1p;
-
-  const lambda = x1pSq / rxSq + y1pSq / rySq;
-  if (lambda > 1) {
-    const s = Math.sqrt(lambda);
-    rx *= s; ry *= s;
-    rxSq = rx * rx; rySq = ry * ry;
-  }
-
-  const sign = largeArcFlag !== sweepFlag ? 1 : -1;
-  const denom = rxSq * y1pSq + rySq * x1pSq;
-  let num = rxSq * rySq - rxSq * y1pSq - rySq * x1pSq;
-  if (num < 0) num = 0;
-  const co = denom === 0 ? 0 : sign * Math.sqrt(num / denom);
-  const cxp = (co * rx * y1p) / ry;
-  const cyp = (co * -ry * x1p) / rx;
-
-  const centerX = cosPhi * cxp - sinPhi * cyp + (x1 + x2) / 2;
-  const centerY = sinPhi * cxp + cosPhi * cyp + (y1 + y2) / 2;
-
-  function angleBetween(ux, uy, vx, vy) {
-    const dot = ux * vx + uy * vy;
-    const lenProduct = Math.sqrt((ux * ux + uy * uy) * (vx * vx + vy * vy)) || 1;
-    let ang = Math.acos(Math.min(1, Math.max(-1, dot / lenProduct)));
-    if (ux * vy - uy * vx < 0) ang = -ang;
-    return ang;
-  }
-
-  const theta1 = angleBetween(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry);
-  let dTheta = angleBetween(
-    (x1p - cxp) / rx, (y1p - cyp) / ry,
-    (-x1p - cxp) / rx, (-y1p - cyp) / ry
-  );
-  if (!sweepFlag && dTheta > 0) dTheta -= 2 * Math.PI;
-  if (sweepFlag && dTheta < 0) dTheta += 2 * Math.PI;
-
-  const numSteps = Math.max(2, Math.ceil((steps * Math.abs(dTheta)) / (Math.PI / 2)));
-  for (let s = 1; s <= numSteps; s++) {
-    const t = theta1 + (dTheta * s) / numSteps;
-    pushPt(
-      cosPhi * rx * Math.cos(t) - sinPhi * ry * Math.sin(t) + centerX,
-      sinPhi * rx * Math.cos(t) + cosPhi * ry * Math.sin(t) + centerY
-    );
-  }
 }
 
 // ------------------------------------------------------------
@@ -819,22 +561,14 @@ function pointAtExtendedDistance(track, distance) {
 // clear() で内容だけリセットするので高速。
 // ------------------------------------------------------------
 function drawCirclesWithMask() {
-  const spacing = CIRCLE_DIAMETER + CIRCLE_GAP;
-
-  // ★画像の縦横比を保ったまま、高さをCIRCLE_DIAMETERに合わせる(ループ外で1回だけ計算)
-  // ピースごとにアスペクト比が異なる場合があるので、描画幅は個別に用意する。
-  // 画像の入っている箱だけを順に使い、スロット番号で巡回して交互に流す
-  const drawH = CIRCLE_DIAMETER;
-  const halfH = drawH / 2;
-  const items = [];
-  pieces.forEach((img, k) => {
-    if (img && tintedPieces[k]) items.push({ raw: tintedPieces[k], w: drawH * (img.width / img.height) });
-  });
+  const items = getPieceItems();
   if (items.length === 0) return;
 
+  const drawH = CIRCLE_DIAMETER;
+  const halfH = drawH / 2;
+
   tracks.forEach((track, idx) => {
-    const total = track.total;
-    if (total === 0) return;
+    if (track.total === 0) return;
 
     const mask   = track.mask;
     const cLayer = track.cLayer;
@@ -842,57 +576,19 @@ function drawCirclesWithMask() {
 
     cLayer.clear();
 
-    const extra = CIRCLE_DIAMETER; // 端の外側にもはみ出させる余白
-    const phase = ((beltOffset % spacing) + spacing) % spacing;
-
-    const iMin = Math.floor((-extra - phase) / spacing);
-    const iMax = Math.ceil((total + extra - phase) / spacing);
-
-    // ★何周目か(beltOffsetがspacingを何回超えたか)。jitterのスロット番号から
-    //   巡回による付け替わりを打ち消すために使う
-    const beltStep = Math.floor(beltOffset / spacing);
-
     // ★p5のpush/translate/rotate/image(状態管理のオーバーヘッドが大きい)を使わず、
     //   生のCanvas2D APIを直接呼ぶことで、画像枚数が多いときの描画コストを下げる
     // ★元画像ではなく、circleColorでtint済みの版(tintedPieces)を描画に使う
     const ctx = cLayer.drawingContext;
 
-    for (let i = iMin; i <= iMax; i++) {
-      const distAlong = i * spacing + phase;
-      if (distAlong < -extra || distAlong > total + extra) continue;
-
-      const p = pointAtExtendedDistance(track, distAlong);
-      if (!p) continue;
-
-      // ★進行方向(p.angle)に垂直な法線方向へ、タイルごとに固定のランダム量だけずらす
-      // iはベルト一周ごとに巡回して使い回される「スロット番号」でしかないため、
-      // そのまま使うと同じ場所を流れるタイルのジッターが周期的に変わってしまう。
-      // beltStep(周回数)を差し引いた slotId は巡回に依存しない固定の識別子になる。
-      const slotId = i - beltStep;
-      const normalAngle = p.angle + Math.PI / 2;
-
-      // ★低周波のnoise()で「揺れる区間/揺れない区間」のゾーンを作り、
-      //   区間の中だけhashRandomの揺れを効かせることでコントラストを出す。
-      //   境界だけZONE_SOFTNESSの幅でなめらかにして、タイル単位でのパチパチした
-      //   切り替わりを防ぐ(ZONE_SOFTNESSを0に近づけるほどくっきりしたON/OFFになる)。
-      const zoneNoise = noise(idx * 500 + slotId * ZONE_SCALE);
-      const gate = constrain((zoneNoise - (ZONE_THRESHOLD - ZONE_SOFTNESS)) / (2 * ZONE_SOFTNESS), 0, 1);
-
-      const jitter = gate * (hashRandom(idx, slotId) * 2 - 1) * JITTER_AMOUNT;
-      const jx = p.x + Math.cos(normalAngle) * jitter;
-      const jy = p.y + Math.sin(normalAngle) * jitter;
-
-      // ★スロット番号でピースを巡回して交互に描画する(2個なら従来のtile/tile2の交互配置)
-      const item = items[((slotId % items.length) + items.length) % items.length];
-      const rawImg = item.raw;
-      const drawW  = item.w;
-
+    forEachPlacement(track, idx, items.length, (n, x, y, angle) => {
+      const item = items[n];
       ctx.save();
-      ctx.translate(jx - mask.bx, jy - mask.by);
-      ctx.rotate(p.angle); // ★進行方向に向けて回転
-      ctx.drawImage(rawImg, -drawW / 2, -halfH, drawW, drawH);
+      ctx.translate(x - mask.bx, y - mask.by);
+      ctx.rotate(angle); // ★進行方向に向けて回転
+      ctx.drawImage(item.raw, -item.w / 2, -halfH, item.w, drawH);
       ctx.restore();
-    }
+    });
 
     // このトラック専用の小さいマスクでクリップ(他パーツと混ざらない)
     // ★JSのピクセルループ(loadPixels/updatePixels)ではなく、
@@ -905,4 +601,285 @@ function drawCirclesWithMask() {
 
     image(cLayer, mask.bx, mask.by);
   });
+}
+
+// ★画像の縦横比を保ったまま、高さをCIRCLE_DIAMETERに合わせた描画幅つきで、
+//   画像の入っている箱だけを返す。画面描画とSVG書き出しで共有する。
+//   k = piecesの添字、raw = 着色済みCanvas、w = 描画幅(px)
+function getPieceItems() {
+  const drawH = CIRCLE_DIAMETER;
+  const items = [];
+  pieces.forEach((img, k) => {
+    if (img && tintedPieces[k]) items.push({ k, raw: tintedPieces[k], w: drawH * (img.width / img.height) });
+  });
+  return items;
+}
+
+// ------------------------------------------------------------
+// トラック上の現在のピース配置を1つずつ fn(n, x, y, angle) に渡す。
+// n = 何番目のピースを使うか(0〜nItems-1)、x/y = ジッター込みの中心座標、angle = 進行方向。
+// 画面描画とSVG書き出しで同じ配置を使うための共通処理。
+// ------------------------------------------------------------
+function forEachPlacement(track, idx, nItems, fn) {
+  const spacing = CIRCLE_DIAMETER + CIRCLE_GAP;
+  const total = track.total;
+  if (total === 0) return;
+
+  const extra = CIRCLE_DIAMETER; // 端の外側にもはみ出させる余白
+  const phase = ((beltOffset % spacing) + spacing) % spacing;
+
+  const iMin = Math.floor((-extra - phase) / spacing);
+  const iMax = Math.ceil((total + extra - phase) / spacing);
+
+  // ★何周目か(beltOffsetがspacingを何回超えたか)。jitterのスロット番号から
+  //   巡回による付け替わりを打ち消すために使う
+  const beltStep = Math.floor(beltOffset / spacing);
+
+  for (let i = iMin; i <= iMax; i++) {
+    const distAlong = i * spacing + phase;
+    if (distAlong < -extra || distAlong > total + extra) continue;
+
+    const p = pointAtExtendedDistance(track, distAlong);
+    if (!p) continue;
+
+    // ★進行方向(p.angle)に垂直な法線方向へ、タイルごとに固定のランダム量だけずらす
+    // iはベルト一周ごとに巡回して使い回される「スロット番号」でしかないため、
+    // そのまま使うと同じ場所を流れるタイルのジッターが周期的に変わってしまう。
+    // beltStep(周回数)を差し引いた slotId は巡回に依存しない固定の識別子になる。
+    const slotId = i - beltStep;
+    const normalAngle = p.angle + Math.PI / 2;
+
+    // ★低周波のnoise()で「揺れる区間/揺れない区間」のゾーンを作り、
+    //   区間の中だけhashRandomの揺れを効かせることでコントラストを出す。
+    //   境界だけZONE_SOFTNESSの幅でなめらかにして、タイル単位でのパチパチした
+    //   切り替わりを防ぐ(ZONE_SOFTNESSを0に近づけるほどくっきりしたON/OFFになる)。
+    const zoneNoise = noise(idx * 500 + slotId * ZONE_SCALE);
+    const gate = constrain((zoneNoise - (ZONE_THRESHOLD - ZONE_SOFTNESS)) / (2 * ZONE_SOFTNESS), 0, 1);
+
+    const jitter = gate * (hashRandom(idx, slotId) * 2 - 1) * JITTER_AMOUNT;
+    const jx = p.x + Math.cos(normalAngle) * jitter;
+    const jy = p.y + Math.sin(normalAngle) * jitter;
+
+    // ★スロット番号でピースを巡回して交互に使う(2個なら従来のtile/tile2の交互配置)
+    fn(((slotId % nItems) + nItems) % nItems, jx, jy, p.angle);
+  }
+}
+
+// ============================================================
+// SVG書き出し(Illustrator等で編集する用)
+//
+// 現在のフレームの配置をそのまま書き出す。構成:
+//   <defs>  ピースの定義(SVGピースは元のSVGの中身、PNGなどは<image>で埋め込み)
+//   背景・トラックの縁取り
+//   線ごとに <g clip-path> でクリップし、中に <use> でピースを配置
+//
+// 線の形のクリップは、ストロークを多角形に変換して <clipPath> にする
+// (Illustratorは <mask> より <clipPath> のほうが安定して読めるため)。
+// ============================================================
+function exportSVG() {
+  const items = getPieceItems();
+  const liveTracks = tracks.filter(t => t !== activeTrack && t.pts.length >= 2 && t.total > 0);
+  // 白い縁取りとクリップは、同じ間引き後の点を使う(別々だと縁がずれて見える)
+  const simplified = new Map(liveTracks.map(t => [t, simplifyPolyline(t.pts, SIMPLIFY_EPSILON)]));
+  if (items.length === 0 || liveTracks.length === 0) {
+    alert('書き出す線がありません');
+    return;
+  }
+
+  const f = v => Math.round(v * 100) / 100;
+  const drawH = CIRCLE_DIAMETER;
+  const tint = color(circleColor).levels;
+  const needsTint = tint[0] < 255 || tint[1] < 255 || tint[2] < 255;
+  const serializer = new XMLSerializer();
+
+  // --- ピースの定義 ---
+  let defs = '';
+  items.forEach(it => {
+    const id = 'piece-' + it.k;
+    const meta = pieceMeta[it.k];
+    if (meta) {
+      const root = new DOMParser().parseFromString(meta.svgText, 'image/svg+xml').documentElement;
+      if (needsTint) tintSvgColors(root, tint);
+      const inner = Array.from(root.childNodes).map(n => serializer.serializeToString(n)).join('');
+      const vb = meta.viewBox;
+      const s = drawH / vb.h;
+      // ピースの中心を原点に置き、高さがdrawHになるよう拡大縮小する
+      defs += `<g id="${id}" transform="scale(${s}) translate(${f(-(vb.minX + vb.w / 2))} ${f(-(vb.minY + vb.h / 2))})">${inner}</g>\n`;
+    } else {
+      // ラスター画像は、着色済みの画像をそのまま埋め込む(ベクターにはならない)
+      defs += `<image id="${id}" x="${f(-it.w / 2)}" y="${f(-drawH / 2)}" width="${f(it.w)}" height="${f(drawH)}" ` +
+              `xlink:href="${it.raw.toDataURL('image/png')}"/>\n`;
+    }
+  });
+
+  // --- 線ごとのクリップとピース配置 ---
+  let clips = '';
+  let body = '';
+  liveTracks.forEach(track => {
+    const idx = tracks.indexOf(track);
+    let uses = '';
+    forEachPlacement(track, idx, items.length, (n, x, y, angle) => {
+      uses += `<use xlink:href="#piece-${items[n].k}" transform="translate(${f(x)} ${f(y)}) rotate(${f(angle * 180 / Math.PI)})"/>\n`;
+    });
+    if (!uses) return;
+    clips += `<clipPath id="clip-${idx}"><path clip-rule="evenodd" d="${strokeOutlinePathD(simplified.get(track), TRACK_WIDTH, f)}"/></clipPath>\n`;
+    body += `<g id="line-${idx}" clip-path="url(#clip-${idx})">\n${uses}</g>\n`;
+  });
+
+  // --- 背景・トラックの縁取り(画面と同じく、ピースより下に敷く) ---
+  let base = '';
+  if (!USE_TRANSPARENT_BG) {
+    base += `<rect id="background" width="${width}" height="${height}" fill="${bkgdColor}"/>\n`;
+  }
+  if (SHOW_TRACK) {
+    liveTracks.forEach((track, n) => {
+      const pts = simplified.get(track).map(p => `${f(p.x)},${f(p.y)}`).join(' ');
+      base += `<polyline id="track-${n}" points="${pts}" fill="none" stroke="${trackColor}" stroke-width="${TRACK_WIDTH}" ` +
+              `stroke-linejoin="miter" stroke-miterlimit="10" stroke-linecap="square"/>\n`;
+    });
+  }
+
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" ` +
+    `width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">\n` +
+    `<defs>\n${defs}${clips}</defs>\n${base}${body}</svg>\n`;
+
+  const blob = new Blob([svg], { type: 'image/svg+xml' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'conveyor-brush.svg';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// 太さ w のストロークを、多角形の集まり(1本の path の d)に変換する。
+// キャンバスの strokeJoin(MITER) / strokeCap(PROJECT) と同じ形になるようにしてある。
+// すべての多角形の巻き方向をそろえて、clipPathの内側で重なっても打ち消し合わないようにする。
+function strokeOutlinePathD(pts, w, f) {
+  const h = w / 2;
+  const polys = [];
+
+  const dirs = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const dx = pts[i + 1].x - pts[i].x, dy = pts[i + 1].y - pts[i].y;
+    const len = Math.hypot(dx, dy) || 1;
+    dirs.push({ x: dx / len, y: dy / len });
+  }
+
+  // 各線分を長方形に(両端は PROJECT キャップとして h だけ延長)
+  for (let i = 0; i < dirs.length; i++) {
+    const d = dirs[i];
+    const nx = -d.y * h, ny = d.x * h;
+    const a = { x: pts[i].x - (i === 0 ? d.x * h : 0), y: pts[i].y - (i === 0 ? d.y * h : 0) };
+    const last = i === dirs.length - 1;
+    const b = { x: pts[i + 1].x + (last ? d.x * h : 0), y: pts[i + 1].y + (last ? d.y * h : 0) };
+    polys.push([
+      { x: a.x + nx, y: a.y + ny }, { x: b.x + nx, y: b.y + ny },
+      { x: b.x - nx, y: b.y - ny }, { x: a.x - nx, y: a.y - ny }
+    ]);
+  }
+
+  // 折れ角の外側にマイター(とがった継ぎ目)を足す
+  for (let i = 1; i < dirs.length; i++) {
+    const d1 = dirs[i - 1], d2 = dirs[i];
+    const cross = d1.x * d2.y - d1.y * d2.x;
+    if (Math.abs(cross) < 1e-6) continue; // ほぼ直線
+    const dot = d1.x * d2.x + d1.y * d2.y;
+    const sgn = cross > 0 ? -1 : 1;      // 折れ曲がりの外側
+    const P = pts[i];
+    const n1 = { x: -d1.y * sgn, y: d1.x * sgn };
+    const n2 = { x: -d2.y * sgn, y: d2.x * sgn };
+    const A = { x: P.x + n1.x * h, y: P.y + n1.y * h };
+    const B = { x: P.x + n2.x * h, y: P.y + n2.y * h };
+    if (1 + dot > 0.02) { // マイター比が10以内ならとがらせる(超えたら面取り)
+      const k = h / (1 + dot);
+      polys.push([P, A, { x: P.x + (n1.x + n2.x) * k, y: P.y + (n1.y + n2.y) * k }, B]);
+    } else {
+      polys.push([P, A, B]);
+    }
+  }
+
+  // 重なった多角形を1つの外形に合体する(穴があれば穴も別のリングとして出る)
+  if (typeof polygonClipping !== 'undefined') {
+    const toPoly = poly => [[...poly, poly[0]].map(p => [p.x, p.y])];
+    const merged = polygonClipping.union(...polys.map(toPoly));
+    return merged.map(polygon =>
+      polygon.map(ring =>
+        'M' + ring.slice(0, -1).map(p => `${f(p[0])} ${f(p[1])}`).join('L') + 'Z'
+      ).join('')
+    ).join('');
+  }
+
+  // ライブラリが読み込めなかった場合は、合体せずに重ねたまま出す
+  console.warn('polygon-clipping が読み込めないため、線の形を合体せずに書き出します');
+  return polys.map(poly => {
+    let area = 0;
+    for (let i = 0; i < poly.length; i++) {
+      const p = poly[i], q = poly[(i + 1) % poly.length];
+      area += p.x * q.y - q.x * p.y;
+    }
+    const ordered = area < 0 ? poly.slice().reverse() : poly;
+    return 'M' + ordered.map(p => `${f(p.x)} ${f(p.y)}`).join('L') + 'Z';
+  }).join('');
+}
+
+// Ramer–Douglas–Peucker法で、折れ線を許容誤差 epsilon(px)以内で単純化する。
+// ドラッグで4pxごとに打った点を間引いて、線の形のクリップを軽くする。
+function simplifyPolyline(pts, epsilon) {
+  if (pts.length < 3) return pts;
+  const keep = new Uint8Array(pts.length);
+  keep[0] = keep[pts.length - 1] = 1;
+  const stack = [[0, pts.length - 1]];
+  while (stack.length) {
+    const [lo, hi] = stack.pop();
+    const a = pts[lo], b = pts[hi];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const len = Math.hypot(dx, dy);
+    let maxD = 0, maxI = -1;
+    for (let i = lo + 1; i < hi; i++) {
+      const d = len === 0
+        ? Math.hypot(pts[i].x - a.x, pts[i].y - a.y)
+        : Math.abs(dy * (pts[i].x - a.x) - dx * (pts[i].y - a.y)) / len;
+      if (d > maxD) { maxD = d; maxI = i; }
+    }
+    if (maxD > epsilon) {
+      keep[maxI] = 1;
+      stack.push([lo, maxI], [maxI, hi]);
+    }
+  }
+  return pts.filter((_, i) => keep[i]);
+}
+
+// SVGの色指定(fill / stroke / stop-color / flood-color と style 属性内)に、
+// 画面と同じ乗算の着色を掛けて書き換える。none / url(...) / currentColor はそのまま。
+function tintSvgColors(root, tint) {
+  const COLOR_PROPS = ['fill', 'stroke', 'stop-color', 'flood-color'];
+  [root, ...root.querySelectorAll('*')].forEach(el => {
+    COLOR_PROPS.forEach(prop => {
+      const v = el.getAttribute(prop);
+      if (v) el.setAttribute(prop, multiplyColor(v, tint));
+    });
+    const style = el.getAttribute('style');
+    if (style) {
+      el.setAttribute('style', style.split(';').map(decl => {
+        const idx = decl.indexOf(':');
+        if (idx === -1) return decl;
+        const prop = decl.slice(0, idx).trim();
+        return COLOR_PROPS.includes(prop) ? `${prop}:${multiplyColor(decl.slice(idx + 1).trim(), tint)}` : decl;
+      }).join(';'));
+    }
+  });
+}
+
+function multiplyColor(value, tint) {
+  const v = value.trim();
+  if (/^(none|transparent|currentcolor|inherit)$/i.test(v) || v.startsWith('url(')) return value;
+  try {
+    const c = color(v).levels;
+    const hex = n => Math.round(n).toString(16).padStart(2, '0');
+    return '#' + hex(c[0] * tint[0] / 255) + hex(c[1] * tint[1] / 255) + hex(c[2] * tint[2] / 255);
+  } catch (e) {
+    return value;
+  }
 }
