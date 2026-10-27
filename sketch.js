@@ -107,7 +107,7 @@ function syncParams() {
 // ------------------------------------------------------------
 function setupPane() {
   pane = new Tweakpane.Pane({
-    title: 'CONVEYOR BRUSH',
+    title: 'Conveyor Brush',
     container: document.getElementById('pane-holder')
   });
 
